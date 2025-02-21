@@ -1,11 +1,12 @@
-use core::panic;
-use std::{io, mem::MaybeUninit, process::exit, ptr, str::from_utf8, usize};
+use std::{io::{self, Write}, mem::MaybeUninit, process::exit, ptr, str::from_utf8};
+
 macro_rules! scan {
     ( $string:expr, $sep:expr, $( $x:ty ),+ ) => {{
         let mut iter = $string.split($sep);
         ($(iter.next().and_then(|word| word.parse::<$x>().ok()),)*)
     }}
 }
+
 const COLUMN_ID_SIZE: usize = 4;
 const COLUMN_USERNAME_SIZE: usize = 32;
 const COLUMN_EMAIL_SIZE: usize = 255;
@@ -17,6 +18,7 @@ const PAGE_SIZE: usize = 4096;
 const MAX_PAGES: usize = 100;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
 const MAX_ROWS: usize = MAX_PAGES * ROWS_PER_PAGE;
+
 #[derive(Debug)]
 enum MetaCommandResult {
     Success,
@@ -32,14 +34,12 @@ enum PrepareResult {
 
 #[derive(Debug)]
 enum ExecuteResult {
-    None,
     Success,
     TableFull,
 }
 
 #[derive(Debug)]
 enum StatementType {
-    None,
     Insert,
     Select,
 }
@@ -51,6 +51,7 @@ struct Row {
     username: [u8; COLUMN_USERNAME_SIZE],
     email: [u8; COLUMN_EMAIL_SIZE]
 }
+
 impl Row {
     fn new(id: u32, username: String, email: String) -> Row {
         let mut row = Row {
@@ -65,37 +66,58 @@ impl Row {
         row.email[..email_bytes.len()].copy_from_slice(email_bytes);
         row
     }
+
     fn print(&self) {
-        if let Ok(username) = from_utf8(self.username.as_ref()) {
-            if let Ok(email) = from_utf8(self.email.as_ref()) {
-                println!("{}, {}, {}", self.id, username, email)
-            }
-        }
+        let username = from_utf8(&self.username).unwrap_or("Invalid UTF-8");
+        let email = from_utf8(&self.email).unwrap_or("Invalid UTF-8");
+        println!("{} {} {}", self.id, username.trim_end_matches('\0'), email.trim_end_matches('\0'));
     }
 }
-fn serialize(row_src: &Option<Row>, row_dst: &mut [u8]) {
+
+fn serialize(row_src: &Row, row_dst: &mut [u8]) {
     unsafe {
-        if let Some(row_src) = row_src {
-            let id_ptr = &row_src.id as *const u32 as *const u8;
-            ptr::copy_nonoverlapping(id_ptr, row_dst[COLUMN_ID_OFFSET..].as_mut_ptr() as *mut u8, COLUMN_ID_SIZE);
-            let username_ptr = row_src.username.as_ptr() as *const u8;
-            ptr::copy_nonoverlapping(username_ptr, row_dst[COLUMN_USERNAME_OFFSET..].as_mut_ptr() as *mut u8, COLUMN_USERNAME_SIZE);
-            let email_ptr = row_src.email.as_ptr() as *const u8;
-            ptr::copy_nonoverlapping(email_ptr, row_dst[COLUMN_EMAIL_OFFSET..].as_mut_ptr() as *mut u8, COLUMN_EMAIL_SIZE);
-        }
+        ptr::copy_nonoverlapping(
+            &row_src.id as *const u32 as *const u8,
+            row_dst.as_mut_ptr().add(COLUMN_ID_OFFSET),
+            COLUMN_ID_SIZE
+        );
+        ptr::copy_nonoverlapping(
+            row_src.username.as_ptr(),
+            row_dst.as_mut_ptr().add(COLUMN_USERNAME_OFFSET),
+            COLUMN_USERNAME_SIZE
+        );
+        ptr::copy_nonoverlapping(
+            row_src.email.as_ptr(),
+            row_dst.as_mut_ptr().add(COLUMN_EMAIL_OFFSET),
+            COLUMN_EMAIL_SIZE
+        );
     }
 }
-fn deserialize(row_src: &mut [u8], row_dst: &mut Option<Row>) {
+
+fn deserialize(row_src: &[u8]) -> Row {
+    let mut row = Row {
+        id: 0,
+        username: [0; COLUMN_USERNAME_SIZE],
+        email: [0; COLUMN_EMAIL_SIZE]
+    };
     unsafe {
-        if let Some(row_dst) = row_dst {
-            let id_ptr = &mut row_dst.id as *mut u32 as *mut u8;
-            ptr::copy_nonoverlapping(row_src[COLUMN_ID_OFFSET..].as_ptr() as *const u8, id_ptr, COLUMN_ID_SIZE);
-            let username_ptr = row_dst.username.as_mut_ptr() as *mut u8;
-            ptr::copy_nonoverlapping(row_src[COLUMN_USERNAME_OFFSET..].as_ptr() as *const u8, username_ptr, COLUMN_USERNAME_SIZE);
-            let email_ptr = row_dst.email.as_mut_ptr() as *mut u8;
-            ptr::copy_nonoverlapping(row_src[COLUMN_EMAIL_OFFSET..].as_ptr() as *const u8, email_ptr, COLUMN_EMAIL_SIZE);
-        }
+        ptr::copy_nonoverlapping(
+            row_src.as_ptr().add(COLUMN_ID_OFFSET),
+            &mut row.id as *mut u32 as *mut u8,
+            COLUMN_ID_SIZE
+        );
+        ptr::copy_nonoverlapping(
+            row_src.as_ptr().add(COLUMN_USERNAME_OFFSET),
+            row.username.as_mut_ptr(),
+            COLUMN_USERNAME_SIZE
+        );
+        ptr::copy_nonoverlapping(
+            row_src.as_ptr().add(COLUMN_EMAIL_OFFSET),
+            row.email.as_mut_ptr(),
+            COLUMN_EMAIL_SIZE
+        );
     }
+    row
 }
 
 #[derive(Debug)]
@@ -111,13 +133,13 @@ impl Table {
             pages: [(); MAX_PAGES].map(|_| None),
         }
     }
+
     fn row_slot(&mut self, index: usize) -> &mut [u8] {
         let page_num = index / ROWS_PER_PAGE;
         if page_num >= MAX_PAGES {
             panic!("Page number out of bounds");
         }
 
-        // Allocate the page if it hasn't been allocated yet
         if self.pages[page_num].is_none() {
             self.pages[page_num] = Some(Box::new([0; PAGE_SIZE]));
         }
@@ -128,8 +150,8 @@ impl Table {
 
         &mut page[byte_offset..byte_offset + ROW_SIZE]
     }
-
 }
+
 #[derive(Debug)]
 struct Statement {
     statement_type: StatementType,
@@ -138,133 +160,91 @@ struct Statement {
 
 fn print_prompt() {
     print!("rsql > ");
-    io::Write::flush(&mut io::stdout()).expect("flush failed!");
+    let _ = io::stdout().flush();
 }
 
-fn do_meta_command(buf: &mut String) -> MetaCommandResult {
-
+fn do_meta_command(buf: &str) -> MetaCommandResult {
     if buf == ".exit" {
         exit(0);
     }
-    else {
-        println!("Unrecognized Command {}.", buf);
-        MetaCommandResult::Unrecognized
-    }
+    println!("Unrecognized Command '{}'.", buf);
+    MetaCommandResult::Unrecognized
 }
 
-fn prepare_statement(buf: &mut String, statement: &mut Statement) -> PrepareResult {
+fn prepare_statement(buf: &str, statement: &mut Statement) -> PrepareResult {
     if buf.starts_with("insert") {
         statement.statement_type = StatementType::Insert;
-        let input = scan!(buf, char::is_whitespace, u32, String, String);
-        if let (Some(id), Some(username), Some(email)) = input {
+        let input = scan!(buf, char::is_whitespace, String, u32, String, String);
+
+        if let (Some(_insert), Some(id), Some(username), Some(email)) = input {
             statement.row_to_insert = Some(Row::new(id, username, email));
+            return PrepareResult::Success;
         }
-        return PrepareResult::Success;
+        return PrepareResult::SyntaxError;
     }
-    else if buf.starts_with("select") {
+    if buf.starts_with("select") {
         statement.statement_type = StatementType::Select;
         return PrepareResult::Success;
     }
     PrepareResult::Unrecognized
 }
 
-fn execute_statement(table: &mut Table, statement: &mut Statement) -> ExecuteResult{
+fn execute_statement(table: &mut Table, statement: &Statement) -> ExecuteResult {
     match statement.statement_type {
         StatementType::Insert => {
-            println!("inserting...");
-            execute_insert(table, statement)
+            if let Some(row) = &statement.row_to_insert {
+                execute_insert(table, row)
+            } else {
+                ExecuteResult::Success
+            }
         }
-        StatementType::Select => {
-            println!("selecting...");
-            execute_select(table, statement)
-        }
-        _ => {
-            ExecuteResult::None
-        }
+        StatementType::Select => execute_select(table),
     }
 }
-fn execute_insert(table: &mut Table, statement: &mut Statement) -> ExecuteResult {
+
+fn execute_insert(table: &mut Table, row: &Row) -> ExecuteResult {
     if table.num_rows >= MAX_ROWS {
         return ExecuteResult::TableFull;
     }
-    serialize(&statement.row_to_insert, table.row_slot(table.num_rows));
+    serialize(row, table.row_slot(table.num_rows));
     table.num_rows += 1;
-    println!("{:?}", table);
-    ExecuteResult::Success
-}
-fn execute_select(table: &mut Table, statement: &mut Statement) -> ExecuteResult {
-    let mut row: Option<Row> = None;
-    for i in 0..table.num_rows {
-        deserialize(table.row_slot(i), &mut row);
-        if let Some(row) = &row {
-            println!("{:?}", row);
-            row.print()
-        }
-    }
     ExecuteResult::Success
 }
 
-fn read_input(buf: &mut String) -> &String {
-    match io::stdin().read_line(buf) {
-        Ok(_bytes_read) => {
-            let trimmed = buf.trim_end().to_string();
-            buf.clear();
-            buf.push_str(&trimmed);
-            buf
-        }
-        Err(_e) => {
-            println!("Error reading input");
-            exit(1)
-        }
+fn execute_select(table: &mut Table) -> ExecuteResult {
+    for i in 0..table.num_rows {
+        let row = deserialize(table.row_slot(i));
+        row.print();
     }
+    ExecuteResult::Success
 }
 
 fn main() {
-    let mut table: Box<Table> = Box::new(Table::new());
-    let mut input_buffer: String = String::new();
+    let mut table = Table::new();
+    let mut input_buffer = String::new();
+
     loop {
-        input_buffer.clear();
         print_prompt();
-        read_input(&mut input_buffer);
-        if input_buffer[0..1] == *"." {
-            match do_meta_command(&mut input_buffer) {
-                MetaCommandResult::Success => {
-                    continue;
-                }
-                MetaCommandResult::Unrecognized => {
-                    println!("Unrecognized Command '{}'.", input_buffer);
-                    continue;
-                }
-                _ => {
-                    println!("Unhandled result, panic");
-                    panic!();
-                }
-            }
-        }
-        let mut statement: Statement = Statement {statement_type: StatementType::None, row_to_insert: None};
-        match prepare_statement(&mut input_buffer, &mut statement) {
-            PrepareResult::Success => { }
-            PrepareResult::SyntaxError => {
-                println!("Syntax Error in '{}'", input_buffer);
-                continue;
-            }
-            PrepareResult::Unrecognized => {
-                println!("Unrecognized keyword at start of '{}'.", input_buffer);
-                continue;
-            }
-            _ => {
-                println!("Unhandled result, panic");
-                panic!();
-            }
-        }
-        match execute_statement(table.as_mut(), &mut statement) {
-            ExecuteResult::Success => {}
-            ExecuteResult::TableFull => {}
-            _ => {
-                println!("Unhandled result, panic");
-                panic!();
-            }
+        input_buffer.clear();
+        io::stdin().read_line(&mut input_buffer).expect("Failed to read input");
+        let input = input_buffer.trim();
+
+        if input.starts_with('.') {
+            do_meta_command(input);
+            continue;
         }
 
+        let mut statement = Statement {
+            statement_type: StatementType::Insert,  // Default value, will be overridden
+            row_to_insert: None
+        };
+
+        match prepare_statement(input, &mut statement) {
+            PrepareResult::Success => {
+                execute_statement(&mut table, &statement);
+            }
+            PrepareResult::SyntaxError => println!("Syntax Error in '{}'", input),
+            PrepareResult::Unrecognized => println!("Unrecognized keyword at start of '{}'", input),
+        }
     }
 }
